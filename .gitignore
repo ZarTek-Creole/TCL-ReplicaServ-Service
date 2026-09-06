@@ -1,0 +1,16 @@
+# Secrets & runtime
+ReplicaServ.conf
+*.local.conf
+logs/
+run/
+*.log
+
+# Backups / scratch
+*.before-*
+*.bak
+*.swp
+*~
+
+# Nested git metadata from vendored modules (keep sources, ignore their .git)
+modules/*/.git/
+modules/*/.github/
