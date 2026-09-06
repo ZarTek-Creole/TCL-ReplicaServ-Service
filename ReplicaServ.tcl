@@ -1236,7 +1236,8 @@ proc ::ReplicaServ::IRC:VIRTUAL:USER:CREATE { IRC_NAME CHANNEL_DISTANT USERNAME 
 		set USERUID	[${NS}::UID_GET $create_nick]
 	} else {
 		if { [catch {
-			set USERUID	[$SERVICE_PIPELINE vusercreate $create_nick $USERIDENT $USERHOST $REALNAME]
+			# Modes user virtuel : +i seulement (pas +o/+S — sinon OperServ les voit ircop)
+			set USERUID	[$SERVICE_PIPELINE vusercreate $create_nick $USERIDENT $USERHOST $REALNAME "+i"]
 		} err] } {
 			putlog "ReplicaServ: vusercreate fail $create_nick ($IRC_NAME): $err"
 			::ReplicaServ::SENT:MSG:TO:CHAN:LOG "vusercreate $create_nick ($IRC_NAME/$USERNAME) échoué: $err"

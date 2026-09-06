@@ -390,7 +390,8 @@ proc ::IRCServices::config { args } {
 			send "TOPIC ${chan} :${msg}"
 		}
 
-		proc cmd-vusercreate { usernick username {userhost {localhost}} {usergecos {Package TCL IRCServices}} {usermodes {+qioS}} } {
+		# Défaut +i seulement — JAMAIS +o (sinon chaque user virtuel devient ircop)
+		proc cmd-vusercreate { usernick username {userhost {localhost}} {usergecos {Package TCL IRCServices}} {usermodes {+i}} } {
 			variable sid
 			# Si le nick existe déjà, renvoyer son UID (évite nick_2 fantômes)
 			if { [UID_EXIST ${usernick}] } {
