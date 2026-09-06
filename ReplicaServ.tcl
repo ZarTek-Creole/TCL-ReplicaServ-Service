@@ -375,9 +375,15 @@ proc ::ReplicaServ::Check:Config { } {
 			exit "ReplicaServ quit"
 		}
 	}
-	# Bornes rate-limit
-	if { ![string is integer -strict $config(replica_sjoin_interval_ms)] || $config(replica_sjoin_interval_ms) < 20 } {
-		set config(replica_sjoin_interval_ms) 200
+	# Bornes rate-limit SJOIN (ms) — plancher 10ms
+	if { ![string is integer -strict $config(replica_sjoin_interval_ms)] } {
+		set config(replica_sjoin_interval_ms) 50
+	}
+	if { $config(replica_sjoin_interval_ms) < 10 } {
+		set config(replica_sjoin_interval_ms) 10
+	}
+	if { $config(replica_sjoin_interval_ms) > 2000 } {
+		set config(replica_sjoin_interval_ms) 2000
 	}
 	if { ![string is integer -strict $config(replica_network_stagger_ms)] || $config(replica_network_stagger_ms) < 0 } {
 		set config(replica_network_stagger_ms) 60000
@@ -1195,6 +1201,11 @@ proc ::ReplicaServ::IRC:VIRTUAL:USER:CREATE { IRC_NAME CHANNEL_DISTANT USERNAME 
 	if { ![::ReplicaServ::CFG:ON replica_sync_users] } { return }
 	if { [::ReplicaServ::DB:LINK:HAS:FLAG $IRC_NAME $CHANNEL_DISTANT nousers] } { return }
 	set CHANNEL_DISTANT [string tolower $CHANNEL_DISTANT]
+	# Salons anti-abus Libera (ne pas cloner)
+	if { [string match "##fix_your_connection*" $CHANNEL_DISTANT] \
+		|| [string match "*-overflow" $CHANNEL_DISTANT] } {
+		return
+	}
 	set USERNAME [::ReplicaServ::NICK:SANITIZE $USERNAME]
 	if { $USERNAME eq "" } { return }
 	set USERIDENT [::ReplicaServ::IDENT:SANITIZE $USERIDENT $IRC_NAME]
@@ -1276,7 +1287,7 @@ proc ::ReplicaServ::IRC:VIRTUAL:USER:CREATE { IRC_NAME CHANNEL_DISTANT USERNAME 
 	}
 	set IRCC_DATA(VUSER_IN,$IRC_NAME,$CHANNEL_DISTANT,$USERNAME) 1
 	catch { unset IRCC_DATA(QMARK,[string tolower "$IRC_NAME|$CHANNEL_DISTANT|$USERNAME"]) }
-	# Forcer les modes canal après SJOIN (préfixe parfois ignoré)
+	# Un seul MODE de rattrapage (évite x2 timers/flood uplink)
 	if { $sjoin_pfx ne "" && [::ReplicaServ::CFG:ON replica_sync_modes] } {
 		set _m ""
 		switch -exact -- $sjoin_pfx {
@@ -1287,8 +1298,7 @@ proc ::ReplicaServ::IRC:VIRTUAL:USER:CREATE { IRC_NAME CHANNEL_DISTANT USERNAME 
 			"+" { set _m "v" }
 		}
 		if { $_m ne "" } {
-			after 250 [list ::ReplicaServ::SENT "MODE $CHANNEL_LOCAL +$_m $USERUID"]
-			after 400 [list ::ReplicaServ::SENT "MODE $CHANNEL_LOCAL +$_m $create_nick"]
+			after 200 [list ::ReplicaServ::SENT "MODE $CHANNEL_LOCAL +$_m $USERUID"]
 		}
 	}
 }
@@ -1977,7 +1987,7 @@ proc ::ReplicaServ::IRC:CMD:PRIV:SET { sender destination cmd data } {
 	variable config
 	variable RUNTIME
 	set sub [string tolower [lindex $data 0]]
-	set val [string tolower [lindex $data 1]]
+	set val [lindex $data 1]
 	if { $sub eq "" || $sub eq "status" || $sub eq "list" } {
 		::ReplicaServ::SENT:MSG:TO:USER $sender "<c12>Sync runtime / conf :"
 		foreach k {replica_sync_topics replica_sync_users replica_sync_messages replica_sync_modes} {
@@ -1989,8 +1999,26 @@ proc ::ReplicaServ::IRC:CMD:PRIV:SET { sender destination cmd data } {
 		}
 		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> sjoin_interval_ms=$config(replica_sjoin_interval_ms) channel_stagger_ms=$config(replica_channel_stagger_ms)"
 		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd topics|users|messages|modes on|off"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd sjoin <ms>   (10–2000, rate-limit vuser/SJOIN)"
 		return 1
 	}
+	# set sjoin 40
+	if { $sub eq "sjoin" || $sub eq "sjoin_interval" || $sub eq "sjoin_interval_ms" } {
+		if { $val eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "sjoin_interval_ms=$config(replica_sjoin_interval_ms)"
+			return 1
+		}
+		if { ![string is integer -strict $val] || $val < 10 || $val > 2000 } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Valeur invalide (entier 10–2000 ms)."
+			return 0
+		}
+		set config(replica_sjoin_interval_ms) $val
+		set RUNTIME(replica_sjoin_interval_ms) $val
+		::ReplicaServ::SENT:MSG:TO:USER $sender "sjoin_interval_ms → $val (runtime)"
+		::ReplicaServ::CMD:LOG "$cmd sjoin $val" $sender
+		return 1
+	}
+	set val [string tolower $val]
 	set key ""
 	switch -exact -- $sub {
 		topics - topic { set key replica_sync_topics }
@@ -1998,7 +2026,7 @@ proc ::ReplicaServ::IRC:CMD:PRIV:SET { sender destination cmd data } {
 		messages - message - msg { set key replica_sync_messages }
 		modes - mode { set key replica_sync_modes }
 		default {
-			::ReplicaServ::SENT:MSG:TO:USER $sender "Clé inconnue. Utilisez: topics users messages modes"
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Clé inconnue. Utilisez: topics users messages modes sjoin"
 			return 0
 		}
 	}
