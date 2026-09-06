@@ -26,7 +26,7 @@ namespace eval ReplicaServ {
 	array set LINK_CACHE			{}
 
 	set config(scriptname)		"ReplicaServ Service"
-	set config(version)			"1.2.20260906"
+	set config(version)			"1.3.20260906b"
 	set config(auteur)			"ZarTek"
 
 	set config(init)			0
@@ -43,7 +43,7 @@ namespace eval ReplicaServ {
 	set config(replica_sync_messages)		1
 	set config(replica_sync_topics)			1
 	set config(replica_sync_modes)			1
-	set config(replica_sjoin_interval_ms)	50
+	set config(replica_sjoin_interval_ms)	25
 	set config(replica_network_stagger_ms)	5000
 	set config(replica_channel_stagger_ms)	10000
 	set config(replica_nick_suffix)			1
@@ -186,6 +186,9 @@ proc ::ReplicaServ::INIT:BOTSERVICE {} {
 		if { [string index [target] 0] != "#" } {
 			if { $cmd eq "help" } {
 				::ReplicaServ::IRC:CMD:PRIV:HELP $sender [target] $cmd $data
+			} elseif { $cmd eq "stats" || $cmd eq "info" || $cmd eq "status" } {
+				# Lecture seule — pas de mot de passe admin
+				::ReplicaServ::IRC:CMD:PRIV:STATS $sender [target] $cmd $data
 			} elseif { $cmd eq "network" } {
 				if { ![::ReplicaServ::AUTH:ADMIN $sender $data] } { return }
 				# data sans le mot de passe admin (dernier arg si auth OK)
@@ -195,7 +198,7 @@ proc ::ReplicaServ::INIT:BOTSERVICE {} {
 				if { ![::ReplicaServ::AUTH:ADMIN $sender $data] } { return }
 				set data [::ReplicaServ::AUTH:STRIP $data]
 				::ReplicaServ::IRC:CMD:PRIV:LINK $sender [target] $cmd $data
-			} elseif { $cmd eq "set" } {
+			} elseif { $cmd eq "set" || $cmd eq "options" || $cmd eq "option" } {
 				if { ![::ReplicaServ::AUTH:ADMIN $sender $data] } { return }
 				set data [::ReplicaServ::AUTH:STRIP $data]
 				::ReplicaServ::IRC:CMD:PRIV:SET $sender [target] $cmd $data
@@ -227,6 +230,9 @@ proc ::ReplicaServ::IRC:LOAD:NETWORKS {} {
 		return
 	}
 	set IRCC_DATA(NETWORKS_LOADED) 1
+	if { ![info exists IRCC_DATA(STARTED_TS)] } {
+		set IRCC_DATA(STARTED_TS) [clock seconds]
+	}
 	::ReplicaServ::SENT:MSG:TO:CHAN:LOG "Chargement des réseaux IRC..."
 	set fichier(network) "[::ReplicaServ::Get:ScriptDir "db"]/network.db"
 	set fp [open $fichier(network) "r"]
@@ -438,6 +444,23 @@ proc ::ReplicaServ::IRC:JOIN { IRC_NAME CHANNEL } {
 	set IRCC_DATA($IRC_NAME,WHO_DELAY) 0
 	$IRCC_DATA($IRC_NAME,PIPELINE) join $CHANNEL
 }
+
+# Salon distant non lié → PART (ex. force-join chaat #30ans-et-plus)
+# Retourne 1 si lié (OK), 0 si part envoyé / ignore
+proc ::ReplicaServ::IRC:REMOTE:ENSURE:LINKED { IRC_NAME CHANNEL } {
+	variable IRCC_DATA
+	set CHANNEL [string tolower $CHANNEL]
+	if { $CHANNEL eq "" || [string index $CHANNEL 0] ne "#" } { return 0 }
+	if { [::ReplicaServ::DB:LINK:LOCAL $IRC_NAME $CHANNEL] ne "" } { return 1 }
+	if { [info exists IRCC_DATA($IRC_NAME,PIPELINE)] } {
+		catch { $IRCC_DATA($IRC_NAME,PIPELINE) part $CHANNEL "not linked" }
+	}
+	::ReplicaServ::SENT:MSG:TO:CHAN:LOG "PART $IRC_NAME $CHANNEL (aucun link)"
+	putlog "ReplicaServ: PART unlinked $IRC_NAME $CHANNEL"
+	catch { unset IRCC_DATA($IRC_NAME,NAMES,$CHANNEL) }
+	return 0
+}
+
 proc ::ReplicaServ::SENT:NOTICE { DEST MSG } {
 	variable SERVICEBOT_PIPELINE
 	$SERVICEBOT_PIPELINE	notice $DEST [::ReplicaServ::apply_visuals $MSG]
@@ -944,8 +967,11 @@ proc ::ReplicaServ::IRC:Connexion { IRC_NAME args } {
 		}
 	}
 	set IRCC_DATA($IRC_NAME,NICK)		$IRC_NICKNAME
+	set IRCC_DATA($IRC_NAME,NICK_WANT)	$IRC_NICKNAME
 	set IRCC_DATA($IRC_NAME,USER)		$IRC_USERNAME
 	set IRCC_DATA($IRC_NAME,AUTOJOINED)	0
+	set IRCC_DATA($IRC_NAME,CONNECTED)	0
+	set IRCC_DATA($IRC_NAME,NICK_COLLISION)	0
 	set PIPELINE $IRCC_DATA($IRC_NAME,PIPELINE)
 	if { [info exists config(uplink_debug)] && $config(uplink_debug) == 1 } {
 		if { [catch { $PIPELINE config logger 1; $PIPELINE config debug 1 } err] } {
@@ -962,9 +988,14 @@ proc ::ReplicaServ::IRC:Connexion { IRC_NAME args } {
 	$PIPELINE registerevent defaultnumeric {
 	}
 	$PIPELINE registerevent 001 "
+		set ::ReplicaServ::IRCC_DATA($IRC_NAME,CONNECTED) 1
+		set ::ReplicaServ::IRCC_DATA($IRC_NAME,CONNECTED_TS) \[clock seconds\]
+		set ::ReplicaServ::IRCC_DATA($IRC_NAME,EOF_COUNT) 0
 		::ReplicaServ::SENT:MSG:TO:CHAN:LOG \"Connexion IRC '$IRC_NAME' OK (001) → \$::ReplicaServ::IRCC_DATA($IRC_NAME,HOST):\$::ReplicaServ::IRCC_DATA($IRC_NAME,PORT)\"
 		putlog \"ReplicaServ: 001 $IRC_NAME\"
 		::ReplicaServ::IRC:AUTO:JOIN:ONCE $IRC_NAME $IRC_NICKNAME
+		# Si nick live ≠ préféré (après 433), tenter reclaim plus tard
+		after 60000 \[list ::ReplicaServ::IRC:NICK:RECLAIM $IRC_NAME\]
 	"
 	$PIPELINE registerevent 376 "
 		# Fin MOTD → filet de sécu si 001 déjà passé sans JOIN
@@ -1051,6 +1082,8 @@ proc ::ReplicaServ::IRC:Connexion { IRC_NAME args } {
 		set ::ReplicaServ::IRCC_DATA($IRC_NAME,TMP_CHAN)	\$channel
 		set ::ReplicaServ::IRCC_DATA($IRC_NAME,CHAN_STATE)	1
 		putlog \"ReplicaServ: 366 $IRC_NAME \$channel names=[llength \$::ReplicaServ::IRCC_DATA($IRC_NAME,NAMES,\$channel)]\"
+		# Force-join / salon hors link.db → PART, pas de WHO
+		if { !\[::ReplicaServ::IRC:REMOTE:ENSURE:LINKED $IRC_NAME \$channel\] } { return }
 		$PIPELINE send \"WHO \$channel\"
 		# BACKFILL immédiat + rappel (WHO peut omettre des +i)
 		after 500 \[list ::ReplicaServ::IRC:NAMES:BACKFILL $IRC_NAME \$channel\]
@@ -1059,11 +1092,21 @@ proc ::ReplicaServ::IRC:Connexion { IRC_NAME args } {
 	"
 	$PIPELINE registerevent 433 "
 		set _cur \$::ReplicaServ::IRCC_DATA($IRC_NAME,NICK)
-		if { \[string equal -nocase \[lindex \[additional\] 0\] \$_cur\] } {
-			set nicknew	\"\[string trimright \$_cur 0123456789\]\[string range \[expr {rand()}\] end-2 end\]\"
-			cmd-send \"NICK \$nicknew\"
+		set _taken \[lindex \[additional\] 0\]
+		if { \$_taken eq \"\" } { set _taken \$_cur }
+		if { \[string equal -nocase \$_taken \$_cur\] || \[string equal -nocase \$_taken \$::ReplicaServ::IRCC_DATA($IRC_NAME,NICK_WANT)\] } {
+			set _base \[string trimright \$_cur 0123456789\]
+			if { \$_base eq \"\" } { set _base \"rs\" }
+			set nicknew \"\$_base\[expr {int(rand()*900)+100}\]\"
+			set nicknew \[::ReplicaServ::NICK:SANITIZE \$nicknew\]
+			if { \$nicknew eq \"\" || \[string equal -nocase \$nicknew \$_cur\] } {
+				set nicknew \"rs\[expr {int(rand()*9000)+1000}\]\"
+			}
+			catch { $PIPELINE send \"NICK \$nicknew\" }
 			set ::ReplicaServ::IRCC_DATA($IRC_NAME,NICK) \$nicknew
-			::ReplicaServ::SENT:MSG:TO:CHAN:LOG \"Le NICK '\$_cur' est utilisé sur $IRC_NAME.. je prend \$nicknew\"
+			set ::ReplicaServ::IRCC_DATA($IRC_NAME,NICK_COLLISION) 1
+			::ReplicaServ::SENT:MSG:TO:CHAN:LOG \"NICK '\$_cur' pris sur $IRC_NAME → \$nicknew (préféré: \$::ReplicaServ::IRCC_DATA($IRC_NAME,NICK_WANT))\"
+			after 120000 \[list ::ReplicaServ::IRC:NICK:RECLAIM $IRC_NAME\]
 		}
 	"
 	$PIPELINE registerevent PRIVMSG "
@@ -1075,12 +1118,20 @@ proc ::ReplicaServ::IRC:Connexion { IRC_NAME args } {
 	$PIPELINE registerevent JOIN "
 		set _mask \[who 1\]
 		set _nick \[lindex \[split \$_mask !\] 0\]
+		set _chan \[string tolower \[target\]\]
+		# Notre bot forcé dans un salon non lié → PART
+		if { \[info exists ::ReplicaServ::IRCC_DATA($IRC_NAME,NICK)\] \
+			&& \[string equal -nocase \$_nick \$::ReplicaServ::IRCC_DATA($IRC_NAME,NICK)\] } {
+			::ReplicaServ::IRC:REMOTE:ENSURE:LINKED $IRC_NAME \$_chan
+			return
+		}
+		if { \[::ReplicaServ::DB:LINK:LOCAL $IRC_NAME \$_chan\] eq \"\" } { return }
 		set _ih   \[lindex \[split \$_mask !\] 1\]
 		set _ident \[lindex \[split \$_ih @\] 0\]
 		set _host  \[lindex \[split \$_ih @\] 1\]
 		if { \$_ident eq \"\" } { set _ident \"~$IRC_NAME\" }
 		if { \$_host eq \"\" } { set _host \"$IRC_NAME.remote\" }
-		::ReplicaServ::IRC:VIRTUAL:USER:ENQUEUE $IRC_NAME \[target\] \$_nick \$_ident \$_host \"Remote user\"
+		::ReplicaServ::IRC:VIRTUAL:USER:ENQUEUE $IRC_NAME \$_chan \$_nick \$_ident \$_host \"Remote user\"
 	"
 	$PIPELINE registerevent PART "
 		::ReplicaServ::IRC:VIRTUAL:USER:PART $IRC_NAME \[target\] \[who\] \[msg\]
@@ -1098,7 +1149,12 @@ proc ::ReplicaServ::IRC:Connexion { IRC_NAME args } {
 	$PIPELINE registerevent EOF "
 		::ReplicaServ::SENT:MSG:TO:CHAN:LOG \"Deconnexion du IRC $IRC_NAME — reconnexion dans 5s\"
 		putlog \"ReplicaServ: EOF $IRC_NAME\"
+		set ::ReplicaServ::IRCC_DATA($IRC_NAME,CONNECTED) 0
 		set ::ReplicaServ::IRCC_DATA($IRC_NAME,AUTOJOINED) 0
+		if { !\[info exists ::ReplicaServ::IRCC_DATA($IRC_NAME,EOF_COUNT)\] } {
+			set ::ReplicaServ::IRCC_DATA($IRC_NAME,EOF_COUNT) 0
+		}
+		incr ::ReplicaServ::IRCC_DATA($IRC_NAME,EOF_COUNT)
 		after 5000 \[list ::ReplicaServ::IRC:Reconnect $IRC_NAME\]
 	"
 
@@ -1128,6 +1184,42 @@ proc ::ReplicaServ::IRC:AUTO:JOIN:ONCE { IRC_NAME IRC_NICKNAME } {
 	set IRCC_DATA($IRC_NAME,AUTOJOINED) 1
 	putlog "ReplicaServ: AUTO:JOIN $IRC_NAME"
 	::ReplicaServ::IRC:AUTO:JOIN $IRC_NAME $IRC_NICKNAME
+	# Refresh périodique (rattrapage +i / manques WHO)
+	after 900000 [list ::ReplicaServ::IRC:RESYNC:NETWORK $IRC_NAME 1]
+}
+
+# Renvoie WHO sur tous les salons liés d'un réseau (resync douce)
+# reschedule=1 → reprogramme +15 min (timer périodique)
+proc ::ReplicaServ::IRC:RESYNC:NETWORK { IRC_NAME {reschedule 0} } {
+	variable IRCC_DATA
+	variable config
+	if { ![info exists IRCC_DATA($IRC_NAME,PIPELINE)] } { return }
+	if { ![info exists IRCC_DATA($IRC_NAME,CONNECTED)] || !$IRCC_DATA($IRC_NAME,CONNECTED) } {
+		if { $reschedule } {
+			after 900000 [list ::ReplicaServ::IRC:RESYNC:NETWORK $IRC_NAME 1]
+		}
+		return
+	}
+	set DB_FILE "[::ReplicaServ::Get:ScriptDir "db"]/link.db"
+	if { ![file exists $DB_FILE] } { return }
+	set fp [open $DB_FILE r]
+	set n 0
+	while { ![eof $fp] } {
+		set line [gets $fp]
+		if { $line eq "" } { continue }
+		if { ![string equal -nocase [lindex $line 0] $IRC_NAME] } { continue }
+		set chan [string tolower [lindex $line 2]]
+		if { $chan eq "" } { continue }
+		catch { $IRCC_DATA($IRC_NAME,PIPELINE) send "WHO $chan" }
+		incr n
+	}
+	close $fp
+	if { $n > 0 } {
+		putlog "ReplicaServ: RESYNC $IRC_NAME ($n salon(s))"
+	}
+	if { $reschedule } {
+		after 900000 [list ::ReplicaServ::IRC:RESYNC:NETWORK $IRC_NAME 1]
+	}
 }
 
 	
@@ -1138,13 +1230,26 @@ proc ::ReplicaServ::IRC:VIRTUAL:USER:ENQUEUE { args } {
 	set CHANNEL  [string tolower [lindex $args 1]]
 	set USERNAME [lindex $args 2]
 	if { $IRC_NAME eq "" || $CHANNEL eq "" || $USERNAME eq "" } { return }
+	# Pas de link → ignore (évite file pour force-joins)
+	if { [::ReplicaServ::DB:LINK:LOCAL $IRC_NAME $CHANNEL] eq "" } { return }
 	set qkey [string tolower "$IRC_NAME|$CHANNEL|$USERNAME"]
 	if { [info exists IRCC_DATA(QMARK,$qkey)] } { return }
 	if { [info exists IRCC_DATA(VUSER_IN,$IRC_NAME,$CHANNEL,$USERNAME)] } { return }
-	set IRCC_DATA(QMARK,$qkey) 1
+	# Garde-fou : file trop longue (WHO/NAMES flood) — éviter OOM / uplink kill
 	if { ![info exists IRCC_DATA(SJOIN_Q)] } {
 		set IRCC_DATA(SJOIN_Q) [list]
 	}
+	set qlen [llength $IRCC_DATA(SJOIN_Q)]
+	if { $qlen >= 20000 } {
+		set now [clock seconds]
+		if { ![info exists IRCC_DATA(SJOIN_DROP_TS)] || ($now - $IRCC_DATA(SJOIN_DROP_TS)) >= 30 } {
+			set IRCC_DATA(SJOIN_DROP_TS) $now
+			::ReplicaServ::SENT:MSG:TO:CHAN:LOG "SJOIN_Q saturée ($qlen) — drop temporaire des nouveaux enqueue"
+			putlog "ReplicaServ: SJOIN_Q full ($qlen), dropping enqueues"
+		}
+		return
+	}
+	set IRCC_DATA(QMARK,$qkey) 1
 	# Normaliser le channel en minuscules dans la queue
 	set args [lreplace $args 1 1 $CHANNEL]
 	lappend IRCC_DATA(SJOIN_Q) $args
@@ -1543,10 +1648,152 @@ proc ::ReplicaServ::AUTH:STRIP { data } {
 	return [lrange $data 0 end-1]
 }
 
+# Reprend le nick préféré (NICK_WANT) si collision temporaire
+proc ::ReplicaServ::IRC:NICK:RECLAIM { IRC_NAME } {
+	variable IRCC_DATA
+	if { ![info exists IRCC_DATA($IRC_NAME,PIPELINE)] } { return }
+	if { ![info exists IRCC_DATA($IRC_NAME,CONNECTED)] || !$IRCC_DATA($IRC_NAME,CONNECTED) } { return }
+	if { ![info exists IRCC_DATA($IRC_NAME,NICK_WANT)] } { return }
+	set want $IRCC_DATA($IRC_NAME,NICK_WANT)
+	set cur ""
+	if { [info exists IRCC_DATA($IRC_NAME,NICK)] } { set cur $IRCC_DATA($IRC_NAME,NICK) }
+	if { $want eq "" || [string equal -nocase $want $cur] } {
+		set IRCC_DATA($IRC_NAME,NICK_COLLISION) 0
+		return
+	}
+	catch { $IRCC_DATA($IRC_NAME,PIPELINE) send "NICK $want" }
+	::ReplicaServ::SENT:MSG:TO:CHAN:LOG "Tentative reclaim nick $IRC_NAME : $cur → $want"
+}
+
+# Compteurs pour stats
+proc ::ReplicaServ::STATS:COUNT:VUSERS { {IRC_NAME ""} } {
+	variable IRCC_DATA
+	set n 0
+	foreach k [array names IRCC_DATA VUSER,*] {
+		if { $IRC_NAME eq "" || $IRCC_DATA($k) eq $IRC_NAME } { incr n }
+	}
+	return $n
+}
+proc ::ReplicaServ::STATS:COUNT:LINKS { {IRC_NAME ""} } {
+	variable LINK_CACHE
+	set n 0
+	# Prefer link.db scan (source of truth)
+	set DB_FILE "[::ReplicaServ::Get:ScriptDir "db"]/link.db"
+	if { ![file exists $DB_FILE] } { return 0 }
+	set fp [open $DB_FILE r]
+	while { ![eof $fp] } {
+		set line [gets $fp]
+		if { $line eq "" } { continue }
+		if { $IRC_NAME eq "" || [string equal -nocase [lindex $line 0] $IRC_NAME] } { incr n }
+	}
+	close $fp
+	return $n
+}
+proc ::ReplicaServ::STATS:QUEUE:LEN {} {
+	variable IRCC_DATA
+	if { ![info exists IRCC_DATA(SJOIN_Q)] } { return 0 }
+	return [llength $IRCC_DATA(SJOIN_Q)]
+}
+proc ::ReplicaServ::STATS:UPTIME:FMT { secs } {
+	if { $secs < 0 } { set secs 0 }
+	set d [expr {$secs / 86400}]
+	set h [expr {($secs % 86400) / 3600}]
+	set m [expr {($secs % 3600) / 60}]
+	set s [expr {$secs % 60}]
+	if { $d > 0 } { return "${d}d ${h}h ${m}m" }
+	if { $h > 0 } { return "${h}h ${m}m ${s}s" }
+	if { $m > 0 } { return "${m}m ${s}s" }
+	return "${s}s"
+}
+
 #######################
 # --> Commandes <-- #
 #######################
 
+proc ::ReplicaServ::IRC:CMD:PRIV:STATS { sender destination cmd data } {
+	variable config
+	variable IRCC_DATA
+	variable RUNTIME
+	set filter [string tolower [lindex $data 0]]
+	set now [clock seconds]
+	if { ![info exists IRCC_DATA(STARTED_TS)] } {
+		set IRCC_DATA(STARTED_TS) $now
+	}
+	set up [::ReplicaServ::STATS:UPTIME:FMT [expr {$now - $IRCC_DATA(STARTED_TS)}]]
+	set qlen [::ReplicaServ::STATS:QUEUE:LEN]
+	set vtot [::ReplicaServ::STATS:COUNT:VUSERS]
+	set ltot [::ReplicaServ::STATS:COUNT:LINKS]
+
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c04>======= <c12>$config(service_nick) v$config(version)<c04> ======="
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> Uptime:<c04> $up  <c07>VUsers:<c04> $vtot  <c07>Links:<c04> $ltot  <c07>SJOIN_Q:<c04> $qlen"
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> SJOIN:<c04> $config(replica_sjoin_interval_ms)ms  <c07>chan_stagger:<c04> $config(replica_channel_stagger_ms)ms  <c07>net_stagger:<c04> $config(replica_network_stagger_ms)ms"
+
+	set syncs [list]
+	foreach k {topics users messages modes} {
+		set ck "replica_sync_$k"
+		if { $k eq "topics" } { set ck replica_sync_topics }
+		if { $k eq "users" } { set ck replica_sync_users }
+		if { $k eq "messages" } { set ck replica_sync_messages }
+		if { $k eq "modes" } { set ck replica_sync_modes }
+		set onoff off
+		if { [::ReplicaServ::CFG:ON $ck] } { set onoff on }
+		lappend syncs "$k=$onoff"
+	}
+	set nsuff off
+	if { [::ReplicaServ::CFG:ON replica_nick_suffix] } { set nsuff on }
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> Sync:<c04> [join $syncs { }]  <c07>nick_suffix:<c04> $nsuff"
+
+	# Réseaux
+	set DB_FILE "[::ReplicaServ::Get:ScriptDir "db"]/network.db"
+	if { [file exists $DB_FILE] } {
+		set fp [open $DB_FILE r]
+		while { ![eof $fp] } {
+			set line [gets $fp]
+			if { $line eq "" } { continue }
+			set name [lindex $line 0]
+			if { $filter ne "" && ![string equal -nocase $filter $name] && $filter ne "all" } {
+				continue
+			}
+			set want_nick [lindex $line 1]
+			set ident [lindex $line 2]
+			set live "?"
+			set want $want_nick
+			set host "-"
+			set state "<c04>down"
+			set cup "-"
+			set eofc 0
+			set links [::ReplicaServ::STATS:COUNT:LINKS $name]
+			set vus [::ReplicaServ::STATS:COUNT:VUSERS $name]
+			if { [info exists IRCC_DATA($name,NICK)] } { set live $IRCC_DATA($name,NICK) }
+			if { [info exists IRCC_DATA($name,NICK_WANT)] } { set want $IRCC_DATA($name,NICK_WANT) }
+			if { [info exists IRCC_DATA($name,HOST)] && [info exists IRCC_DATA($name,PORT)] } {
+				set host "$IRCC_DATA($name,HOST):$IRCC_DATA($name,PORT)"
+			}
+			if { [info exists IRCC_DATA($name,CONNECTED)] && $IRCC_DATA($name,CONNECTED) } {
+				set state "<c03>up"
+				if { [info exists IRCC_DATA($name,CONNECTED_TS)] } {
+					set cup [::ReplicaServ::STATS:UPTIME:FMT [expr {$now - $IRCC_DATA($name,CONNECTED_TS)}]]
+				}
+			} elseif { [info exists IRCC_DATA($name,PIPELINE)] } {
+				set state "<c08>reconnecting"
+			}
+			if { [info exists IRCC_DATA($name,EOF_COUNT)] } { set eofc $IRCC_DATA($name,EOF_COUNT) }
+			set nicknote ""
+			if { ![string equal -nocase $live $want] } {
+				set nicknote " <c08>(want $want)"
+			}
+			if { [info exists IRCC_DATA($name,NICK_COLLISION)] && $IRCC_DATA($name,NICK_COLLISION) } {
+				append nicknote " <c04>\[collision\]"
+			}
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c12>$name <c04>\[$state<c04>\] <c07>nick:<c04> $live$nicknote <c07>ident:<c04> $ident"
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07>  server:<c04> $host  <c07>up:<c04> $cup  <c07>links:<c04> $links  <c07>vusers:<c04> $vus  <c07>eof:<c04> $eofc"
+		}
+		close $fp
+	}
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c04>======= /msg $config(service_nick) help ======="
+	::ReplicaServ::CMD:LOG "$cmd $filter" $sender
+	return 1
+}
 proc ::ReplicaServ::IRC:CMD:PRIV:LINK { sender destination cmd data } {
 	variable config
 	variable IRCC_DATA
@@ -1855,13 +2102,56 @@ proc ::ReplicaServ::IRC:CMD:PRIV:NETWORK { sender destination cmd data } {
 		}
 
 	} elseif { $sub_cmd == "nick" } {
-		# NETWORK NICK <réseau> <nouveau_nick>
-		set IRC_NAME [lindex $cmd_data 0]
-		set NEW_NICK [lindex $cmd_data 1]
-		if { $IRC_NAME eq "" || $NEW_NICK eq "" } {
-			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd nick <réseau> <nickname>"
+		# NETWORK NICK <réseau>                     → status
+		# NETWORK NICK <réseau> <nouveau_nick>      → change + persist
+		# NETWORK NICK reclaim <réseau>             → tenter NICK_WANT
+		set a0 [lindex $cmd_data 0]
+		set a1 [lindex $cmd_data 1]
+		if { [string equal -nocase $a0 reclaim] || [string equal -nocase $a0 restore] } {
+			set IRC_NAME $a1
+			if { $IRC_NAME eq "" } {
+				::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd nick reclaim <réseau>"
+				return 0
+			}
+			if { ![::ReplicaServ::DB:NETWORK:EXIST $IRC_NAME] } {
+				::ReplicaServ::SENT:MSG:TO:USER $sender "Réseau $IRC_NAME introuvable."
+				return 0
+			}
+			# Aligner NICK_WANT sur network.db
+			set line [::ReplicaServ::DB:NETWORK:GET:LINE $IRC_NAME]
+			if { $line ne "" } {
+				set IRCC_DATA($IRC_NAME,NICK_WANT) [lindex $line 1]
+			}
+			::ReplicaServ::IRC:NICK:RECLAIM $IRC_NAME
+			set live "?"
+			set want "?"
+			if { [info exists IRCC_DATA($IRC_NAME,NICK)] } { set live $IRCC_DATA($IRC_NAME,NICK) }
+			if { [info exists IRCC_DATA($IRC_NAME,NICK_WANT)] } { set want $IRCC_DATA($IRC_NAME,NICK_WANT) }
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Reclaim $IRC_NAME demandé (live=$live want=$want)"
+			return 1
+		}
+		set IRC_NAME $a0
+		set NEW_NICK $a1
+		if { $IRC_NAME eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd nick <réseau> \[nickname\]"
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd nick reclaim <réseau>"
 			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> Exemple:<c04> /msg $config(service_nick) $cmd nick entrechat MayMiow"
 			return 0
+		}
+		# Affichage seul
+		if { $NEW_NICK eq "" } {
+			set line [::ReplicaServ::DB:NETWORK:GET:LINE $IRC_NAME]
+			if { $line eq "" } {
+				::ReplicaServ::SENT:MSG:TO:USER $sender "Réseau $IRC_NAME introuvable."
+				return 0
+			}
+			set dbnick [lindex $line 1]
+			set live "?"
+			set want $dbnick
+			if { [info exists IRCC_DATA($IRC_NAME,NICK)] } { set live $IRCC_DATA($IRC_NAME,NICK) }
+			if { [info exists IRCC_DATA($IRC_NAME,NICK_WANT)] } { set want $IRCC_DATA($IRC_NAME,NICK_WANT) }
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c12>$IRC_NAME <c07>live:<c04> $live  <c07>want:<c04> $want  <c07>db:<c04> $dbnick"
+			return 1
 		}
 		set NEW_NICK [::ReplicaServ::NICK:SANITIZE $NEW_NICK]
 		if { $NEW_NICK eq "" } {
@@ -1893,11 +2183,109 @@ proc ::ReplicaServ::IRC:CMD:PRIV:NETWORK { sender destination cmd data } {
 		close $fp
 		set old ""
 		if { [info exists IRCC_DATA($IRC_NAME,NICK)] } { set old $IRCC_DATA($IRC_NAME,NICK) }
-		set IRCC_DATA($IRC_NAME,NICK) $NEW_NICK
+		set IRCC_DATA($IRC_NAME,NICK_WANT) $NEW_NICK
+		set IRCC_DATA($IRC_NAME,NICK_COLLISION) 0
 		if { [info exists IRCC_DATA($IRC_NAME,PIPELINE)] } {
 			catch { $IRCC_DATA($IRC_NAME,PIPELINE) send "NICK $NEW_NICK" }
+			# NICK live mis à jour à la conf serveur (event NICK) ; on anticipe
+			set IRCC_DATA($IRC_NAME,NICK) $NEW_NICK
+		} else {
+			set IRCC_DATA($IRC_NAME,NICK) $NEW_NICK
 		}
 		::ReplicaServ::SENT:MSG:TO:USER $sender "Nick $IRC_NAME : $old → $NEW_NICK (persisté dans network.db)"
+
+	} elseif { $sub_cmd == "ident" || $sub_cmd == "user" || $sub_cmd == "username" } {
+		# NETWORK IDENT <réseau> [<ident>]
+		set IRC_NAME [lindex $cmd_data 0]
+		set NEW_IDENT [lindex $cmd_data 1]
+		if { $IRC_NAME eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd ident <réseau> \[username\]"
+			return 0
+		}
+		set line [::ReplicaServ::DB:NETWORK:GET:LINE $IRC_NAME]
+		if { $line eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Réseau $IRC_NAME introuvable."
+			return 0
+		}
+		if { $NEW_IDENT eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c12>$IRC_NAME <c07>ident:<c04> [lindex $line 2]"
+			return 1
+		}
+		regsub -all {[^A-Za-z0-9._~-]} $NEW_IDENT {_} NEW_IDENT
+		set NEW_IDENT [string range $NEW_IDENT 0 9]
+		if { $NEW_IDENT eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Ident invalide."
+			return 0
+		}
+		set nick [lindex $line 1]
+		set addrs [lindex $line 3]
+		set new_line "$IRC_NAME $nick $NEW_IDENT $addrs"
+		set fp [open $DB_FILE r]
+		set out [list]
+		while { ![eof $fp] } {
+			set l [gets $fp]
+			if { $l eq "" } { continue }
+			if { [string equal -nocase [lindex $l 0] $IRC_NAME] } {
+				lappend out $new_line
+			} else {
+				lappend out $l
+			}
+		}
+		close $fp
+		set fp [open $DB_FILE w+]
+		foreach l $out { puts $fp $l }
+		close $fp
+		set IRCC_DATA($IRC_NAME,USER) $NEW_IDENT
+		::ReplicaServ::SENT:MSG:TO:USER $sender "Ident $IRC_NAME → $NEW_IDENT (persisté ; actif au prochain reconnect)"
+
+	} elseif { $sub_cmd == "reconnect" || $sub_cmd == "rehash" } {
+		set IRC_NAME [lindex $cmd_data 0]
+		if { $IRC_NAME eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd reconnect <réseau>"
+			return 0
+		}
+		if { ![::ReplicaServ::DB:NETWORK:EXIST $IRC_NAME] } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Réseau $IRC_NAME introuvable."
+			return 0
+		}
+		# Recharger nick/ident depuis DB avant reconnect
+		set line [::ReplicaServ::DB:NETWORK:GET:LINE $IRC_NAME]
+		if { $line ne "" } {
+			set IRCC_DATA($IRC_NAME,NICK) [lindex $line 1]
+			set IRCC_DATA($IRC_NAME,NICK_WANT) [lindex $line 1]
+			set IRCC_DATA($IRC_NAME,USER) [lindex $line 2]
+			set IRCC_DATA($IRC_NAME,NICK_COLLISION) 0
+		}
+		if { ![info exists IRCC_DATA($IRC_NAME,PIPELINE)] } {
+			# Première connexion
+			if { $line ne "" } {
+				::ReplicaServ::IRC:Connexion $IRC_NAME [lindex $line 3] [lindex $line 1] [lindex $line 2]
+			}
+		} else {
+			catch { $IRCC_DATA($IRC_NAME,PIPELINE) send "QUIT ReplicaServ reconnect" }
+			set IRCC_DATA($IRC_NAME,CONNECTED) 0
+			set IRCC_DATA($IRC_NAME,AUTOJOINED) 0
+			after 2000 [list ::ReplicaServ::IRC:Reconnect $IRC_NAME 0]
+		}
+		::ReplicaServ::SENT:MSG:TO:USER $sender "Reconnect $IRC_NAME lancé."
+
+	} elseif { $sub_cmd == "info" || $sub_cmd == "status" } {
+		# Détail d'un réseau (admin) — délègue à stats filtrées
+		set IRC_NAME [lindex $cmd_data 0]
+		::ReplicaServ::IRC:CMD:PRIV:STATS $sender $destination stats [list $IRC_NAME]
+
+	} elseif { $sub_cmd == "resync" || $sub_cmd == "sync" || $sub_cmd == "who" } {
+		set IRC_NAME [lindex $cmd_data 0]
+		if { $IRC_NAME eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd resync <réseau>"
+			return 0
+		}
+		if { ![info exists IRCC_DATA($IRC_NAME,PIPELINE)] } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Réseau $IRC_NAME non connecté."
+			return 0
+		}
+		::ReplicaServ::IRC:RESYNC:NETWORK $IRC_NAME
+		::ReplicaServ::SENT:MSG:TO:USER $sender "Resync WHO lancé pour $IRC_NAME"
 
 	} elseif { $sub_cmd == "list" } {
 		set FILE_PIPE	[open $DB_FILE "r"]
@@ -1961,9 +2349,13 @@ proc ::ReplicaServ::IRC:CMD:PRIV:NETWORK { sender destination cmd data } {
 		foreach LINE_NEW $FILE_NEW_DATA { puts $FILE_PIPE $LINE_NEW }
 		close $FILE_PIPE
 		if { $STATE } {
-			set IRC_PIPELINE	"$IRCC_DATA($IRC_NAME,PIPELINE)"
 			::ReplicaServ::CMD:LOG "Suppression du réseau $IRC_NAME réussi.." $sender
-			$IRC_PIPELINE destroy
+			if { [info exists IRCC_DATA($IRC_NAME,PIPELINE)] } {
+				catch { $IRCC_DATA($IRC_NAME,PIPELINE) send "QUIT ReplicaServ remove" }
+				catch { $IRCC_DATA($IRC_NAME,PIPELINE) destroy }
+				catch { unset IRCC_DATA($IRC_NAME,PIPELINE) }
+			}
+			set IRCC_DATA($IRC_NAME,CONNECTED) 0
 			::ReplicaServ::SENT:MSG:TO:USER $sender "Suppression du réseau $IRC_NAME réussi.."
 			return 1
 		} else {
@@ -1978,7 +2370,11 @@ proc ::ReplicaServ::IRC:CMD:PRIV:NETWORK { sender destination cmd data } {
 		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Remove" 15]<c12>- <c06> Suprime un réseau"
 		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network List" 15]<c12>- <c06> Liste des réseaux"
 		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Server" 15]<c12>- <c06> add|del|list serveurs d'un réseau"
-		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Nick" 15]<c12>- <c06> Change le nick distant (persisté)"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Nick" 15]<c12>- <c06> voir|changer nick distant (+ reclaim)"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Ident" 15]<c12>- <c06> voir|changer ident (reconnect)"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Reconnect" 15]<c12>- <c06> Force reconnexion d'un réseau"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Resync" 15]<c12>- <c06> WHO sur les salons liés"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network Info" 15]<c12>- <c06> Stats d'un réseau"
 		::ReplicaServ::SENT:MSG:TO:USER $sender "<c04>"
 	}
 	::ReplicaServ::CMD:LOG "$cmd $sub_cmd $cmd_data" $sender
@@ -1988,21 +2384,21 @@ proc ::ReplicaServ::IRC:CMD:PRIV:SET { sender destination cmd data } {
 	variable RUNTIME
 	set sub [string tolower [lindex $data 0]]
 	set val [lindex $data 1]
-	if { $sub eq "" || $sub eq "status" || $sub eq "list" } {
-		::ReplicaServ::SENT:MSG:TO:USER $sender "<c12>Sync runtime / conf :"
-		foreach k {replica_sync_topics replica_sync_users replica_sync_messages replica_sync_modes} {
+	if { $sub eq "" || $sub eq "status" || $sub eq "list" || $sub eq "show" } {
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c12>Options runtime / conf :"
+		foreach k {replica_sync_topics replica_sync_users replica_sync_messages replica_sync_modes replica_nick_suffix} {
 			set src conf
 			if { [info exists RUNTIME($k)] } { set src runtime }
 			set onoff off
 			if { [::ReplicaServ::CFG:ON $k] } { set onoff on }
 			::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $k = $onoff <c04>($src)"
 		}
-		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> sjoin_interval_ms=$config(replica_sjoin_interval_ms) channel_stagger_ms=$config(replica_channel_stagger_ms)"
-		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd topics|users|messages|modes on|off"
-		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd sjoin <ms>   (10–2000, rate-limit vuser/SJOIN)"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> sjoin_interval_ms=$config(replica_sjoin_interval_ms) channel_stagger_ms=$config(replica_channel_stagger_ms) network_stagger_ms=$config(replica_network_stagger_ms)"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd topics|users|messages|modes|nicksuffix on|off"
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> $cmd sjoin|chanstagger|netstagger <ms>"
 		return 1
 	}
-	# set sjoin 40
+	# set sjoin / staggers (ms)
 	if { $sub eq "sjoin" || $sub eq "sjoin_interval" || $sub eq "sjoin_interval_ms" } {
 		if { $val eq "" } {
 			::ReplicaServ::SENT:MSG:TO:USER $sender "sjoin_interval_ms=$config(replica_sjoin_interval_ms)"
@@ -2018,6 +2414,36 @@ proc ::ReplicaServ::IRC:CMD:PRIV:SET { sender destination cmd data } {
 		::ReplicaServ::CMD:LOG "$cmd sjoin $val" $sender
 		return 1
 	}
+	if { $sub eq "chanstagger" || $sub eq "channel_stagger" || $sub eq "channel_stagger_ms" } {
+		if { $val eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "channel_stagger_ms=$config(replica_channel_stagger_ms)"
+			return 1
+		}
+		if { ![string is integer -strict $val] || $val < 0 || $val > 120000 } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Valeur invalide (0–120000 ms)."
+			return 0
+		}
+		set config(replica_channel_stagger_ms) $val
+		set RUNTIME(replica_channel_stagger_ms) $val
+		::ReplicaServ::SENT:MSG:TO:USER $sender "channel_stagger_ms → $val (runtime)"
+		::ReplicaServ::CMD:LOG "$cmd chanstagger $val" $sender
+		return 1
+	}
+	if { $sub eq "netstagger" || $sub eq "network_stagger" || $sub eq "network_stagger_ms" } {
+		if { $val eq "" } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "network_stagger_ms=$config(replica_network_stagger_ms)"
+			return 1
+		}
+		if { ![string is integer -strict $val] || $val < 0 || $val > 120000 } {
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Valeur invalide (0–120000 ms)."
+			return 0
+		}
+		set config(replica_network_stagger_ms) $val
+		set RUNTIME(replica_network_stagger_ms) $val
+		::ReplicaServ::SENT:MSG:TO:USER $sender "network_stagger_ms → $val (runtime)"
+		::ReplicaServ::CMD:LOG "$cmd netstagger $val" $sender
+		return 1
+	}
 	set val [string tolower $val]
 	set key ""
 	switch -exact -- $sub {
@@ -2025,8 +2451,9 @@ proc ::ReplicaServ::IRC:CMD:PRIV:SET { sender destination cmd data } {
 		users - user { set key replica_sync_users }
 		messages - message - msg { set key replica_sync_messages }
 		modes - mode { set key replica_sync_modes }
+		nicksuffix - nick_suffix - suffix { set key replica_nick_suffix }
 		default {
-			::ReplicaServ::SENT:MSG:TO:USER $sender "Clé inconnue. Utilisez: topics users messages modes sjoin"
+			::ReplicaServ::SENT:MSG:TO:USER $sender "Clé inconnue. Utilisez: topics users messages modes nicksuffix sjoin chanstagger netstagger"
 			return 0
 		}
 	}
@@ -2047,16 +2474,35 @@ proc ::ReplicaServ::IRC:CMD:PRIV:SET { sender destination cmd data } {
 	return 1
 }
 proc ::ReplicaServ::IRC:CMD:PRIV:HELP { sender destination cmd data } {
+	set topic [string tolower [lindex $data 0]]
+	if { $topic eq "stats" || $topic eq "info" || $topic eq "status" } {
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> stats|info|status \[réseau\] — état (sans mot de passe)"
+		return
+	}
+	if { $topic eq "network" } {
+		::ReplicaServ::IRC:CMD:PRIV:NETWORK $sender $destination network [list]
+		return
+	}
+	if { $topic eq "link" } {
+		::ReplicaServ::IRC:CMD:PRIV:LINK $sender $destination link [list]
+		return
+	}
+	if { $topic eq "set" || $topic eq "options" } {
+		::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> set|options … <pass> — sync + sjoin + staggers + nicksuffix"
+		return
+	}
 	::ReplicaServ::IRC:CMD:PUB:HELP $sender $destination $cmd $data
 }
 proc ::ReplicaServ::IRC:CMD:PUB:HELP { sender destination cmd data } {
 	::ReplicaServ::SENT:MSG:TO:USER $sender "<c04> .: <c12>Aide publique<c04> :."
 	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "!Help" 15]<c12>- <c06> Affiche cette aide"
-	::ReplicaServ::SENT:MSG:TO:USER $sender "<c04> .: <c12>Aide privé<c04> :."
-	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network" 15]<c12>- <c06> Gestion des réseaux IRC (+ nick, servers)"
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c04> .: <c12>Aide privé (sans pass)<c04> :."
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Stats|Info" 15]<c12>- <c06> État réseaux / queue / sync"
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c04> .: <c12>Aide privé (admin + pass)<c04> :."
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Network" 15]<c12>- <c06> réseaux, nick, ident, reconnect, servers"
 	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Link" 15]<c12>- <c06> Liens (+ flags notopic, topic on|off)"
-	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Set" 15]<c12>- <c06> topics|users|messages|modes on|off"
-	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Help <Commande>" 15]<c12>- <c06> Affiche l'aide de <Commande>"
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Set|Options" 15]<c12>- <c06> sync, sjoin, staggers, nicksuffix"
+	::ReplicaServ::SENT:MSG:TO:USER $sender "<c07> [::ReplicaServ::TXT:ESPACE:DISPLAY "Help <cmd>" 15]<c12>- <c06> Aide d'une commande"
 	::ReplicaServ::CMD:LOG $cmd $sender
 }
 ##########################################
